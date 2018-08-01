@@ -1,0 +1,14 @@
+name = "eAtlas file usage"
+description = "[eatlas_file_usage] Update file usage to files within node / file body. This module is used to give a feedback to the user to tell where the nodes / files are used."
+core = "7.x"
+
+files[] = "eatlas_file_usage.module"
+files[] = "includes/eatlas_file_usage_block.inc"
+
+package = "eAtlas"
+
+; Attributes used by the update module.
+; There fields needs to be removed if the module is migrated to Drupal.org
+project status url = "http://drupal.eatlas.org.au/modules/eatlas"
+version = "7.x-1.0"
+project = "eatlas_file_usage"

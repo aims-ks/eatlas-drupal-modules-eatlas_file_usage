@@ -1,0 +1,306 @@
+<?php
+define('EATLAS_FILE_USAGE_NODE_INDEX', 'ea_node_ref');
+define('EATLAS_FILE_USAGE_FILE_INDEX', 'ea_file_ref');
+
+module_load_include('inc', 'eatlas_file_usage', 'includes/eatlas_file_usage_block');
+
+// Implement: hook_search_info
+// This hook is needed, otherwise the module will not be considered
+//     as a search module and the hook_update_index will be ignored.
+function eatlas_file_usage_search_info() {
+	return array();
+}
+
+// Implement: hook_search_access()
+// HACK: Tell Drupal that this search module is private for everyone,
+//     so the module will not produce a search tab (disable the search
+//     feature) but the hook_update_index will still be called.
+function eatlas_file_usage_search_access() {
+	return FALSE;
+}
+
+// Implement: hook_search_status
+function eatlas_file_usage_search_status() {
+	$status = array('remaining' => 0, 'total' => 0);
+
+	// Nodes
+	$status['total'] += db_query('SELECT COUNT(*) FROM {node}')->fetchField();
+	$status['remaining'] += db_query("SELECT COUNT(*) FROM {node} n LEFT JOIN {search_dataset} d ON d.type = '".EATLAS_FILE_USAGE_NODE_INDEX."' AND d.sid = n.nid WHERE d.sid IS NULL OR d.reindex <> 0")->fetchField();
+
+	// Files
+	$status['total'] += db_query('SELECT COUNT(*) FROM {file_managed}')->fetchField();
+	$status['remaining'] += db_query("SELECT COUNT(*) FROM {file_managed} f LEFT JOIN {search_dataset} d ON d.type = '".EATLAS_FILE_USAGE_FILE_INDEX."' AND d.sid = f.fid WHERE d.sid IS NULL OR d.reindex <> 0")->fetchField();
+
+	return $status;
+}
+
+// Implement: hook_search_reset
+function eatlas_file_usage_search_reset() {
+	db_update('search_dataset')
+		->fields(array('reindex' => REQUEST_TIME))
+		->condition('type', array(EATLAS_FILE_USAGE_NODE_INDEX, EATLAS_FILE_USAGE_FILE_INDEX), 'IN')
+		->execute();
+}
+
+// Implements hook_node_update().
+function eatlas_file_usage_node_update($node) {
+	db_update('search_dataset')
+		->fields(array('reindex' => REQUEST_TIME))
+		->condition('sid', $node->nid)
+		->condition('type', EATLAS_FILE_USAGE_NODE_INDEX, '=')
+		->execute();
+}
+// hook_node_delete($node)
+function eatlas_file_usage_node_delete($node) {
+	_eatlas_file_usage_delete_index($node->nid, EATLAS_FILE_USAGE_NODE_INDEX);
+}
+
+// Implements hook_file_update().
+function eatlas_file_usage_file_update($file) {
+	db_update('search_dataset')
+		->fields(array('reindex' => REQUEST_TIME))
+		->condition('sid', $file->fid)
+		->condition('type', EATLAS_FILE_USAGE_FILE_INDEX, '=')
+		->execute();
+}
+// hook_file_delete($file)
+function eatlas_file_usage_file_delete($file) {
+	_eatlas_file_usage_delete_index($file->fid, EATLAS_FILE_USAGE_FILE_INDEX);
+}
+
+function _eatlas_file_usage_delete_index($sid, $type) {
+	$delete_index = db_delete('search_index', array('target' => 'slave'));
+	$delete_index->condition('sid', $sid, '=');
+	$delete_index->condition('type', $type, '=');
+	$num_words_deleted = $delete_index->execute();
+
+	// search_node_links (I don't know where this is used)
+	//     sid => Index element which has a link to the node (nid)
+	//     nid => Node refered by the link
+	$delete_node_links = db_delete('search_node_links', array('target' => 'slave'));
+	$delete_node_links->condition('sid', $sid, '=');
+	$delete_node_links->condition('type', $type, '=');
+	$num_links_deleted = $delete_node_links->execute();
+
+	// If it's a node, also delete refences pointing to that node
+	if ($type === EATLAS_FILE_USAGE_NODE_INDEX) {
+		$delete_node_links = db_delete('search_node_links', array('target' => 'slave'));
+		$delete_node_links->condition('nid', $sid, '=');
+		$delete_node_links->condition('type', $type, '=');
+		$num_links_deleted += $delete_node_links->execute();
+	}
+
+	// search_dataset
+	// Indexed items (nodes, files, rss, etc) and its metadata (re-index flag, indexed data, etc.)
+	$delete_dataset = db_delete('search_dataset', array('target' => 'slave'));
+	$delete_dataset->condition('sid', $sid, '=');
+	$delete_dataset->condition('type', $type, '=');
+	$num_dataset_deleted = $delete_dataset->execute();
+
+	return $num_dataset_deleted;
+}
+
+
+// Implement: hook_update_index
+// Run a regex over the whole body content (nodes / files), find
+//     file usages and update the usages in the
+//     file file usage table.
+function eatlas_file_usage_update_index() {
+	_eatlas_file_usage_remove_orphan();
+
+	// This indexation is quite fast, it doesn't matter if it runs 100 nodes AND 100 files...
+	$limit = (int)variable_get('search_cron_limit', 100);
+
+	$nodesResult = db_query_range("SELECT n.nid FROM {node} n LEFT JOIN {search_dataset} d ON d.type = '".EATLAS_FILE_USAGE_NODE_INDEX."' AND d.sid = n.nid WHERE d.sid IS NULL OR d.reindex <> 0 ORDER BY d.reindex ASC, n.nid ASC", 0, $limit, array(), array('target' => 'slave'));
+	foreach ($nodesResult as $node) {
+		$node = node_load($node->nid);
+		_eatlas_file_usage_index_item($node->nid, $node, 'node', EATLAS_FILE_USAGE_NODE_INDEX);
+	}
+
+	$filesResult = db_query_range("SELECT f.fid FROM {file_managed} f LEFT JOIN {search_dataset} d ON d.type = '".EATLAS_FILE_USAGE_FILE_INDEX."' AND d.sid = f.fid WHERE d.sid IS NULL OR d.reindex <> 0 ORDER BY d.reindex ASC, f.fid ASC", 0, $limit, array(), array('target' => 'slave'));
+	foreach ($filesResult as $file) {
+		$file = file_load($file->fid);
+		_eatlas_file_usage_index_item($file->fid, $file, 'file', EATLAS_FILE_USAGE_FILE_INDEX);
+	}
+}
+
+// Index a file or a node
+function _eatlas_file_usage_index_item($id, $item, $type, $index) {
+	$fileRef = array(); // fid => { 'file' => file Object, 'count' => Nb references }
+
+	// Delete all file usage for all file used by this module by this node (or file).
+	// The file usage will be re-added later by this method.
+	// NOTE: It's important to delete everything first since it's almost
+	//     impossible (certainly harder) to know which images were in
+	//     CKEditor before the edit, but has been removed.
+	_eatlas_file_usage_delete($type, $id);
+
+	// TODO Loop through all fields, find CKEditor fields (currently only apply to Body)
+	$bodyField = field_get_items($type, $item, 'body');
+	if ($bodyField) {
+		// NOTE: The method field_view_value replace the image markup
+		//     of the media module with actual HTML. From this point,
+		//     I can just ignore the existance of the media module and
+		//     look for image tags.
+		$bodyValue = render(field_view_value($type, $item, 'body', $bodyField[0]));
+
+		preg_match_all('/<img[^>]+src=[\'"]([^\'"]+)[\'"][^>]*>/i', $bodyValue, $images);
+		if (isset($images[1])) {
+			foreach ($images[1] as $imageSrc) {
+				$imageObj = _eatlas_file_usage_get_image_obj($imageSrc);
+				if ($imageObj != NULL) {
+					$imageFile = $imageObj['file'];
+					$imageId = $imageFile->fid;
+					if ($imageFile != NULL) {
+						if (!isset($fileRef[$imageId])) {
+							$fileRef[$imageId] = array(
+								'file' => $imageFile,
+								'count' => 1
+							);
+						} else {
+							$fileRef[$imageId]['count']++;
+						}
+					}
+				}
+			}
+		}
+
+		// Update files usage
+		if (!empty($fileRef)) {
+			foreach($fileRef as $fid => $fileObj) {
+				$file = $fileObj['file'];
+				$count = $fileObj['count'];
+				// https://api.drupal.org/api/drupal/includes%21file.inc/function/file_usage_add/7
+				file_usage_add($file, 'eatlas_file_usage', $type, $id, $count);
+			}
+		}
+	}
+
+	// Update the index table 'search_dataset' to flag this item as been indexed
+	// NOTE: Since the indexed text is an empty string, the search_index
+	//     method simply flag the node / file has been indexed. It's very quick.
+	search_index($id, $index, '');
+}
+
+/**
+ * Delete all file usage for all file used by this module by a specific item (node or image).
+ * $type: 'node' or 'file'
+ * $id: The node or file ID that may hold some file usage.
+ * Example:
+ *     The node ID 5 has references to 10 images in it's body field.
+ *     After running the cron, this module has inserted file usages for
+ *     all of those 10 images, refering to the node ID 5.
+ *     The following call will remove all file usages for those 10 images:
+ *         _eatlas_file_usage_delete('node', 5);
+ */
+function _eatlas_file_usage_delete($type, $id) {
+	// Query inspired from file_usage_delete()
+	db_delete('file_usage', array('target' => 'slave'))
+			->condition('module', 'eatlas_file_usage')
+			->condition('type', $type)
+			->condition('id', $id)
+			->execute();
+}
+
+/**
+ * This method is doing some reverse enginering to find which image
+ * object has been used to generate the image URL.
+ * It ask Drupal for all file matching the filename (using EntityFieldQuery),
+ * generate all possible URLs for every image styles and return the
+ * file object if one of those URL match exactly the URL received
+ * in parameter.
+ *
+ * Return an associative array containing the file object and the image
+ * style used to create the URL.
+ * Array(
+ *     'style': The image style (medium, thumbnail, etc.) or NULL if the original image was used.
+ *     'file': The file Object.
+ * )
+ */
+function _eatlas_file_usage_get_image_obj($imageSrc) {
+	$image_styles = image_styles();
+
+	// Remove what is after the "?" and call basename on it (basename returns the filename)
+	$filename = array_shift(explode('?', basename($imageSrc)));
+
+	// See example: https://api.drupal.org/api/drupal/includes%21file.inc/function/file_load_multiple/7
+	$file_efq = new EntityFieldQuery();
+	$file_efq->entityCondition('entity_type', 'file')
+			->propertyCondition('filename', $filename);
+	$file_efq_result = $file_efq->execute();
+	if (!empty($file_efq_result)) {
+		foreach($file_efq_result as $fileMap) {
+			foreach($fileMap as $fid => $miniFile) {
+				$file = file_load($fid);
+
+				$fileOrigUrl = file_create_url($file->uri);
+				if ($imageSrc === $fileOrigUrl) {
+					return array(
+						'style' => NULL,
+						'file' => $file
+					);
+				}
+
+				// Loop through all file types, get the URL for that file
+				// styles and verify if it match the URL received.
+				// If it does, return the file ID.
+				foreach($image_styles as $isid => $image_style) {
+					$fileStyleUrl = image_style_url($isid, $file->uri);
+					if ($imageSrc === $fileStyleUrl) {
+						return array(
+							'style' => $isid,
+							'file' => $file
+						);
+					}
+				}
+
+			}
+		}
+	}
+
+	return NULL;
+}
+
+// Remove orphan index / usage
+function _eatlas_file_usage_remove_orphan() {
+	// search_dataset
+	// Indexed items (nodes, files, rss, etc) and its metadata (re-index flag, indexed data, etc.)
+	$delete_dataset = db_delete('search_dataset', array('target' => 'slave'));
+	$delete_dataset->where(
+			'(type = :node AND sid NOT IN (SELECT nid from {node})) OR ' .
+			'(type = :file AND sid NOT IN (SELECT fid from {file_managed}))',
+		array(
+			':node' => EATLAS_FILE_USAGE_NODE_INDEX,
+			':file' => EATLAS_FILE_USAGE_FILE_INDEX
+		)
+	);
+	$num_dataset_deleted = $delete_dataset->execute();
+
+	$delete_usage = db_delete('file_usage', array('target' => 'slave'))->condition('module', 'eatlas_file_usage');
+	$delete_usage->where(
+			'(type = :node AND id NOT IN (SELECT nid from {node})) OR ' .
+			'(type = :file AND id NOT IN (SELECT fid from {file_managed}))',
+		array(
+			':node' => 'node',
+			':file' => 'file'
+		)
+	);
+	$num_usage_deleted = $delete_usage->execute();
+
+	$num_deleted_str = '';
+	if ($num_usage_deleted) {
+		$num_deleted_str .= "$num_usage_deleted file usage deleted";
+	}
+	if ($num_dataset_deleted) {
+		if ($num_deleted_str) {
+			$num_deleted_str .= ' and ';
+		}
+		$num_deleted_str .= "$num_dataset_deleted file usage indexes deleted";
+	}
+
+	if ($num_deleted_str) {
+		watchdog('eatlas_file_usage', $num_deleted_str);
+	}
+}
+
+?>
