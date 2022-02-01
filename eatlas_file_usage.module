@@ -140,9 +140,10 @@ function _eatlas_file_usage_index_item($id, $item, $type, $index) {
 	if ($bodyField) {
 		// NOTE: The method field_view_value replace the image markup
 		//     of the media module with actual HTML. From this point,
-		//     I can just ignore the existance of the media module and
+		//     I can just ignore the existence of the media module and
 		//     look for image tags.
-		$bodyValue = render(field_view_value($type, $item, 'body', $bodyField[0]));
+		$bodyFieldInstance = field_view_value($type, $item, 'body', $bodyField[0]);
+		$bodyValue = render($bodyFieldInstance);
 
 		preg_match_all('/<img[^>]+src=[\'"]([^\'"]+)[\'"][^>]*>/i', $bodyValue, $images);
 		if (isset($images[1])) {
@@ -221,7 +222,8 @@ function _eatlas_file_usage_get_image_obj($imageSrc) {
 	$image_styles = image_styles();
 
 	// Remove what is after the "?" and call basename on it (basename returns the filename)
-	$filename = array_shift(explode('?', basename($imageSrc)));
+	$imageSrcParts = explode('?', basename($imageSrc));
+	$filename = array_shift($imageSrcParts);
 
 	// See example: https://api.drupal.org/api/drupal/includes%21file.inc/function/file_load_multiple/7
 	$file_efq = new EntityFieldQuery();
